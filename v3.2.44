@@ -1,0 +1,504 @@
+# -*- coding: utf-8 -*-
+"""Binance + Bybit USDT perpetual scanner V3.2.43.
+Tracks the RSI(6) follow-up signals corresponding to the purple and pink arrows:
+after an RSI(6) move of at least 15 points plus a cross of RSI(24), alert when RSI(6)
+subsequently crosses above RSI(24) (purple) or below RSI(24) (pink). Requires signal-candle quote turnover >
+10,000 USDT. Preserves the existing exchange scan, push, deduplication, and loop
+framework from V3.2.41.
+"""
+import base64
+import json
+import os
+import sys
+import time
+import threading
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from datetime import datetime, timezone
+from urllib.parse import quote
+import requests
+
+# Keep console and systemd journal output explicitly UTF-8 to prevent mojibake.
+os.environ.setdefault("PYTHONUTF8", "1")
+for _stream in (sys.stdout, sys.stderr):
+    try:
+        _stream.reconfigure(encoding="utf-8", errors="backslashreplace", line_buffering=True)
+    except (AttributeError, OSError, ValueError):
+        pass
+
+VERSION = "V3.2.44"
+MIN_QUOTE_VOLUME = 10000.0
+INTERVALS = ("5m", "1h")
+KLINE_LIMIT = 100
+MAX_WORKERS = 8
+REQUEST_TIMEOUT = 12
+STATE_FILE = "volume_ma5_state_v3233.json"
+SCAN_PAUSE_SECONDS = 5
+# Topic is a standalone name, without scheme or server URL.
+NTFY_TOPIC = os.getenv("NTFY_TOPIC", "billion-dollar8747356867").strip().strip("/")
+NTFY_SERVERS = [
+    os.getenv("NTFY_SERVER_1", "https://ntfy.sh").strip().rstrip("/"),
+    os.getenv("NTFY_SERVER_2", "https://ntfy.envs.net").strip().rstrip("/"),
+]
+NTFY_URLS = list(dict.fromkeys(
+    f"{server}/{NTFY_TOPIC}"
+    for server in NTFY_SERVERS
+    if server.startswith("https://") and NTFY_TOPIC
+))
+SESSION = requests.Session()
+SESSION.headers.update({"User-Agent": "CryptoPerpRsiFollowScanner/3.2.43"})
+STATE_LOCK = threading.Lock()
+PRINT_LOCK = threading.Lock()
+
+
+def log(*args):
+    with PRINT_LOCK:
+        print(*args, flush=True)
+
+
+def load_state():
+    try:
+        with open(STATE_FILE, "r", encoding="utf-8") as f:
+            obj = json.load(f)
+        return obj if isinstance(obj, dict) else {"sent": {}}
+    except (FileNotFoundError, json.JSONDecodeError, OSError):
+        return {"sent": {}}
+
+
+def save_state(state):
+    tmp = STATE_FILE + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(state, f, ensure_ascii=False, separators=(",", ":"))
+    os.replace(tmp, STATE_FILE)
+
+
+def get_binance_symbols():
+    url = "https://fapi.binance.com/fapi/v1/exchangeInfo"
+    r = SESSION.get(url, timeout=REQUEST_TIMEOUT)
+    r.raise_for_status()
+    data = r.json()
+    return sorted({x["symbol"] for x in data.get("symbols", [])
+                   if x.get("status") == "TRADING" and x.get("quoteAsset") == "USDT"
+                   and x.get("contractType") == "PERPETUAL"})
+
+
+def get_bybit_symbols():
+    url = "https://api.bybit.com/v5/market/instruments-info"
+    result, cursor = set(), None
+    while True:
+        params = {"category": "linear", "limit": 1000}
+        if cursor:
+            params["cursor"] = cursor
+        r = SESSION.get(url, params=params, timeout=REQUEST_TIMEOUT)
+        r.raise_for_status()
+        data = r.json()
+        if data.get("retCode") != 0:
+            raise RuntimeError(f"Bybit instruments error: {data.get('retMsg')}")
+        for x in data.get("result", {}).get("list", []):
+            if x.get("status") == "Trading" and x.get("quoteCoin") == "USDT" and x.get("contractType") == "LinearPerpetual":
+                result.add(x["symbol"])
+        cursor = data.get("result", {}).get("nextPageCursor") or None
+        if not cursor:
+            break
+    return sorted(result)
+
+
+def fetch_server_time_ms(exchange):
+    """Read the exchange clock once per scan round."""
+    if exchange == "Binance":
+        r = SESSION.get("https://fapi.binance.com/fapi/v1/time", timeout=REQUEST_TIMEOUT)
+        r.raise_for_status()
+        return int(r.json()["serverTime"])
+    r = SESSION.get("https://api.bybit.com/v5/market/time", timeout=REQUEST_TIMEOUT)
+    r.raise_for_status()
+    data = r.json()
+    if data.get("retCode") != 0:
+        raise RuntimeError(f"Bybit server time error: {data.get('retMsg')}")
+    result = data.get("result", {})
+    return int(result.get("timeNano", "0")) // 1_000_000 if result.get("timeNano") else int(result["timeSecond"]) * 1000
+
+
+def fetch_klines(exchange, symbol, interval, server_time_ms):
+    if exchange == "Binance":
+        url = "https://fapi.binance.com/fapi/v1/klines"
+        r = SESSION.get(url, params={"symbol": symbol, "interval": interval, "limit": KLINE_LIMIT}, timeout=REQUEST_TIMEOUT)
+        r.raise_for_status()
+        raw = r.json()
+        rows = [{"open_time": int(x[0]), "close_time": int(x[6]), "volume": float(x[5]),
+                 "quote_volume": float(x[7]), "close": float(x[4])} for x in raw]
+    else:
+        url = "https://api.bybit.com/v5/market/kline"
+        r = SESSION.get(url, params={"category": "linear", "symbol": symbol, "interval": {"5m":"5", "1h":"60"}[interval], "limit": KLINE_LIMIT}, timeout=REQUEST_TIMEOUT)
+        r.raise_for_status()
+        data = r.json()
+        if data.get("retCode") != 0:
+            raise RuntimeError(f"Bybit kline error: {data.get('retMsg')}")
+        raw = data.get("result", {}).get("list", [])
+        rows = [{"open_time": int(x[0]), "close_time": int(x[0]) + (300000 if interval == "5m" else 3600000) - 1,
+                 "volume": float(x[5]), "quote_volume": float(x[6]), "close": float(x[4])} for x in raw]
+    rows.sort(key=lambda x: x["open_time"])
+    # Include the current in-progress candle. The latest candle is evaluated
+    # live; its volume and quote volume can change between scan rounds.
+    return rows
+
+
+def chart_url(exchange, symbol, interval):
+    ticker = ("BINANCE:" if exchange == "Binance" else "BYBIT:") + symbol + ".P"
+    return "https://www.tradingview.com/chart/?symbol=" + quote(ticker, safe=":") + "&interval=" + ("5" if interval == "5m" else "60")
+
+
+def send_ntfy(title, body, click_url):
+    if not NTFY_URLS:
+        log("[NTFY未配置] 未找到有效 NTFY_TOPIC / NTFY_SERVER_1 / NTFY_SERVER_2；本次报警未推送。")
+        return False
+    any_success = False
+    for endpoint in NTFY_URLS:
+        try:
+            r = SESSION.post(endpoint, data=body.encode("utf-8"),
+                headers={"Title": "=?UTF-8?B?" + base64.b64encode(title.encode("utf-8")).decode("ascii") + "?=", "Content-Type": "text/plain; charset=utf-8", "Click": click_url}, timeout=10)
+            if r.ok:
+                any_success = True
+                log(f"[NTFY成功] endpoint={endpoint}")
+            else:
+                log(f"[NTFY失败] endpoint={endpoint} HTTP {r.status_code}: {r.text[:160]}")
+        except Exception as exc:
+            log(f"[NTFY异常] endpoint={endpoint}: {exc}")
+    # Any endpoint success means the alert is delivered; avoid duplicate sends.
+    return any_success
+
+
+def rsi_wilder(values, length):
+    """Calculate Wilder RSI similarly to TradingView ta.rsi()."""
+    result = [None] * len(values)
+    if len(values) <= length:
+        return result
+    gains = [0.0] * len(values)
+    losses = [0.0] * len(values)
+    for i in range(1, len(values)):
+        delta = values[i] - values[i - 1]
+        gains[i] = max(delta, 0.0)
+        losses[i] = max(-delta, 0.0)
+    avg_gain = sum(gains[1:length + 1]) / length
+    avg_loss = sum(losses[1:length + 1]) / length
+
+    def rsi_value(gain, loss):
+        if loss == 0:
+            return 100.0 if gain > 0 else 50.0
+        if gain == 0:
+            return 0.0
+        rs = gain / loss
+        return 100.0 - (100.0 / (1.0 + rs))
+
+    result[length] = rsi_value(avg_gain, avg_loss)
+    for i in range(length + 1, len(values)):
+        avg_gain = ((avg_gain * (length - 1)) + gains[i]) / length
+        avg_loss = ((avg_loss * (length - 1)) + losses[i]) / length
+        result[i] = rsi_value(avg_gain, avg_loss)
+    return result
+
+
+def calculate_any_arrow_series(rsi6, rsi24):
+    """Return whether each candle has any of the six TradingView arrow types.
+
+    Normal arrows are the RSI(6) +/-15-point signals. Strong arrows are a
+    subset of those signals. Follow-up arrows are the first RSI(6)/RSI(24) upward or downward cross after
+    the corresponding strong signal.
+    """
+    arrow = [False] * len(rsi6)
+    wait_rise = False
+    wait_fall = False
+    for i in range(2, len(rsi6)):
+        current6, prev6, prev2_6 = rsi6[i], rsi6[i - 1], rsi6[i - 2]
+        current24, prev24 = rsi24[i], rsi24[i - 1]
+        if None in (current6, prev6, prev2_6, current24, prev24):
+            continue
+
+        change1 = current6 - prev6
+        change2 = current6 - prev2_6
+        up_signal = change1 >= 15.0 or change2 >= 15.0
+        down_signal = change1 <= -15.0 or change2 <= -15.0
+        strong_up = up_signal and current6 > current24 and prev6 <= prev24
+        strong_down = down_signal and current6 < current24 and prev6 >= prev24
+
+        follow_rise = wait_rise and current6 > current24 and prev6 <= prev24
+        follow_fall = wait_fall and current6 < current24 and prev6 >= prev24
+        arrow[i] = up_signal or down_signal or follow_rise or follow_fall
+
+        if follow_rise:
+            wait_rise = False
+        if follow_fall:
+            wait_fall = False
+        if strong_down:
+            wait_rise = True
+        if strong_up:
+            wait_fall = True
+    return arrow
+
+
+def process_one(exchange, symbol, interval, server_time_ms, state, stats):
+    try:
+        candles = fetch_klines(exchange, symbol, interval, server_time_ms)
+        with PRINT_LOCK:
+            stats["success"] += 1
+
+        # Keep the existing scan timeframe: tracking signals are evaluated on closed 1h candles.
+        if interval != "1h":
+            return
+        closed_candles = [x for x in candles if x["close_time"] < server_time_ms]
+        if len(closed_candles) < 27:
+            return
+
+        closes = [x["close"] for x in closed_candles]
+        rsi6 = rsi_wilder(closes, 6)
+        rsi24 = rsi_wilder(closes, 24)
+        any_arrow = calculate_any_arrow_series(rsi6, rsi24)
+        tracker_key = f"{exchange}|{symbol}|{interval}"
+
+        with STATE_LOCK:
+            tracker_saved = state.setdefault("tracker", {}).get(tracker_key)
+            tracker = dict(tracker_saved) if isinstance(tracker_saved, dict) else None
+
+        # On first start, rebuild the waiting state from history without alerting on old candles.
+        if tracker is None:
+            wait_rise = False
+            wait_fall = False
+            start_index = max(2, len(closed_candles) - 1)
+            for i in range(2, start_index):
+                current6, prev6, prev2_6 = rsi6[i], rsi6[i - 1], rsi6[i - 2]
+                current24, prev24 = rsi24[i], rsi24[i - 1]
+                if None in (current6, prev6, prev2_6, current24, prev24):
+                    continue
+                change1 = current6 - prev6
+                change2 = current6 - prev2_6
+                up_signal = change1 >= 15.0 or change2 >= 15.0
+                down_signal = change1 <= -15.0 or change2 <= -15.0
+                strong_up = up_signal and current6 > current24 and prev6 <= prev24
+                strong_down = down_signal and current6 < current24 and prev6 >= prev24
+                if wait_rise and current6 > current24 and prev6 <= prev24:
+                    wait_rise = False
+                if wait_fall and current6 < current24 and prev6 >= prev24:
+                    wait_fall = False
+                if strong_down:
+                    wait_rise = True
+                if strong_up:
+                    wait_fall = True
+            last_processed_time = closed_candles[start_index - 1]["open_time"] if start_index > 0 else 0
+            tracker = {"last_open_time": last_processed_time, "wait_rise": wait_rise, "wait_fall": wait_fall}
+
+        last_processed_time = int(tracker.get("last_open_time", 0))
+        new_indices = [i for i, c in enumerate(closed_candles) if c["open_time"] > last_processed_time]
+        if not new_indices:
+            return
+
+        wait_rise = bool(tracker.get("wait_rise", False))
+        wait_fall = bool(tracker.get("wait_fall", False))
+
+        for i in new_indices:
+            candle = closed_candles[i]
+            next_wait_rise = wait_rise
+            next_wait_fall = wait_fall
+            follow_rise = False
+            follow_fall = False
+            strong_up = False
+            strong_down = False
+
+            if i >= 2:
+                current6, prev6, prev2_6 = rsi6[i], rsi6[i - 1], rsi6[i - 2]
+                current24, prev24 = rsi24[i], rsi24[i - 1]
+                if None not in (current6, prev6, prev2_6, current24, prev24):
+                    change1 = current6 - prev6
+                    change2 = current6 - prev2_6
+                    up_signal = change1 >= 15.0 or change2 >= 15.0
+                    down_signal = change1 <= -15.0 or change2 <= -15.0
+                    strong_up = up_signal and current6 > current24 and prev6 <= prev24
+                    strong_down = down_signal and current6 < current24 and prev6 >= prev24
+
+                    # Evaluate previously armed follow-up signals before arming new ones,
+                    # matching the Pine indicator's same-candle behavior.
+                    if next_wait_rise and current6 > current24 and prev6 <= prev24:
+                        follow_rise = True
+                        next_wait_rise = False
+                    if next_wait_fall and current6 < current24 and prev6 >= prev24:
+                        follow_fall = True
+                        next_wait_fall = False
+                    if strong_down:
+                        next_wait_rise = True
+                    if strong_up:
+                        next_wait_fall = True
+
+            if follow_rise or follow_fall:
+                # Strict three-closed-candle sequence:
+                # newest = purple/pink follow-up; previous = cyan/yellow strong arrow;
+                # two candles back = any green/red/cyan/yellow arrow.
+                previous_is_strong = False
+                two_back_has_allowed_arrow = False
+                if i >= 2:
+                    p6, pp6, pp2_6 = rsi6[i - 1], rsi6[i - 2], rsi6[i - 3] if i >= 3 else None
+                    p24, pp24 = rsi24[i - 1], rsi24[i - 2]
+                    if i >= 3 and None not in (p6, pp6, pp2_6, p24, pp24):
+                        p_change1 = p6 - pp6
+                        p_change2 = p6 - pp2_6
+                        p_up = p_change1 >= 15.0 or p_change2 >= 15.0
+                        p_down = p_change1 <= -15.0 or p_change2 <= -15.0
+                        previous_strong_up = p_up and p6 > p24 and pp6 <= pp24
+                        previous_strong_down = p_down and p6 < p24 and pp6 >= pp24
+                        previous_is_strong = previous_strong_up or previous_strong_down
+                    # Any-arrow on the two-back candle, but only green/red/cyan/yellow types;
+                    # ordinary up/down or strong up/down arrows qualify, follow-up arrows do not.
+                    if i >= 3:
+                        t6, tprev6, tprev2_6 = rsi6[i - 2], rsi6[i - 3], rsi6[i - 4] if i >= 4 else None
+                        t24, tprev24 = rsi24[i - 2], rsi24[i - 3]
+                        if i >= 4 and None not in (t6, tprev6, tprev2_6, t24, tprev24):
+                            t_c1 = t6 - tprev6
+                            t_c2 = t6 - tprev2_6
+                            t_up = t_c1 >= 15.0 or t_c2 >= 15.0
+                            t_down = t_c1 <= -15.0 or t_c2 <= -15.0
+                            t_strong_up = t_up and t6 > t24 and tprev6 <= tprev24
+                            t_strong_down = t_down and t6 < t24 and tprev6 >= tprev24
+                            # This candle qualifies if it has a regular arrow or strong arrow.
+                            two_back_has_allowed_arrow = t_up or t_down or t_strong_up or t_strong_down
+                if not (previous_is_strong and two_back_has_allowed_arrow):
+                    log(f"[三周期颜色顺序过滤] {exchange} {symbol} 1h {('紫色后续上涨箭头' if follow_rise else '粉色后续下跌箭头')} 未报警：要求前一根为青/黄加强箭头，前两根为红/绿/青/黄箭头")
+                    with STATE_LOCK:
+                        state.setdefault("tracker", {})[tracker_key] = {
+                            "last_open_time": candle["open_time"],
+                            "wait_rise": next_wait_rise,
+                            "wait_fall": next_wait_fall,
+                        }
+                        save_state(state)
+                    wait_rise = next_wait_rise
+                    wait_fall = next_wait_fall
+                    continue
+
+                # Apply the existing >10,000 USDT quote-volume filter to the tracking candle.
+                if candle["quote_volume"] > MIN_QUOTE_VOLUME:
+                    signal_type = "紫色后续上涨箭头" if follow_rise else "粉色后续下跌箭头"
+                    direction = "上穿 RSI(24)" if follow_rise else "下穿 RSI(24)"
+                    key = f"{exchange}|{symbol}|{interval}|{candle['open_time']}|{signal_type}"
+                    cooldown_key = f"{exchange}|{symbol}|{interval}"
+                    with STATE_LOCK:
+                        already_sent = key in state.setdefault("sent", {})
+                        last_alert_ms = int(state.setdefault("last_alert_by_contract", {}).get(cooldown_key, 0))
+                    candle_close_ms = int(candle["close_time"])
+                    cooldown_active = last_alert_ms > 0 and candle_close_ms - last_alert_ms < 3600_000
+                    if cooldown_active:
+                        log(f"[每合约每小时限频] {exchange} {symbol} 本小时已报警，跳过重复推送")
+                        already_sent = True
+                    if not already_sent:
+                        title = f"{VERSION}｜RSI追踪信号{signal_type}｜{exchange} {symbol}"
+                        body = (f"交易所：{exchange}\n合约：{symbol}\n周期：1h\n"
+                                f"追踪信号：{signal_type}\n"
+                                f"条件：RSI(6) 在对应加强信号之后{direction}\n"
+                                f"RSI(6)：{rsi6[i]:.4f}\nRSI(24)：{rsi24[i]:.4f}\n"
+                                f"信号K线报价成交额：{candle['quote_volume']:.2f} USDT（必须 > 10000）\n"
+                                f"信号K线开盘时间（UTC）：{datetime.fromtimestamp(candle['open_time']/1000, timezone.utc).isoformat()}\n"
+                                f"信号K线收盘时间（UTC）：{datetime.fromtimestamp(candle['close_time']/1000, timezone.utc).isoformat()}\n"
+                                f"图表：{chart_url(exchange, symbol, interval)}")
+                        with PRINT_LOCK:
+                            stats["candidates"] += 1
+                        if not send_ntfy(title, body, chart_url(exchange, symbol, interval)):
+                            log(f"[追踪报警未送达，可重试] {exchange} {symbol} 1h {signal_type}")
+                            # Do not advance tracker past a signal that failed to send.
+                            return
+                        with STATE_LOCK:
+                            state.setdefault("sent", {})[key] = {
+                                "sent_at": int(time.time()),
+                                "signal": signal_type,
+                                "rsi6": rsi6[i],
+                                "rsi24": rsi24[i],
+                                "quote_volume": candle["quote_volume"],
+                                "candle_open_time": candle["open_time"],
+                                "candle_status": "closed",
+                            }
+                            state.setdefault("last_alert_by_contract", {})[cooldown_key] = candle_close_ms
+                            state.setdefault("tracker", {})[tracker_key] = {
+                                "last_open_time": candle["open_time"],
+                                "wait_rise": next_wait_rise,
+                                "wait_fall": next_wait_fall,
+                            }
+                            save_state(state)
+                            stats["alerts"] += 1
+                        log(f"[追踪报警成功] {exchange} {symbol} 1h {signal_type}｜RSI6={rsi6[i]:.4f}｜RSI24={rsi24[i]:.4f}｜报价成交额={candle['quote_volume']:.2f} USDT")
+                    else:
+                        with STATE_LOCK:
+                            state.setdefault("tracker", {})[tracker_key] = {
+                                "last_open_time": candle["open_time"],
+                                "wait_rise": next_wait_rise,
+                                "wait_fall": next_wait_fall,
+                            }
+                            save_state(state)
+                else:
+                    log(f"[追踪信号成交额未达标] {exchange} {symbol} 1h 报价成交额={candle['quote_volume']:.2f} USDT；要求 > 10000")
+                    # Signal is not eligible; consume it and continue tracking.
+                    with STATE_LOCK:
+                        state.setdefault("tracker", {})[tracker_key] = {
+                            "last_open_time": candle["open_time"],
+                            "wait_rise": next_wait_rise,
+                            "wait_fall": next_wait_fall,
+                        }
+                        save_state(state)
+            else:
+                with STATE_LOCK:
+                    state.setdefault("tracker", {})[tracker_key] = {
+                        "last_open_time": candle["open_time"],
+                        "wait_rise": next_wait_rise,
+                        "wait_fall": next_wait_fall,
+                    }
+                    save_state(state)
+
+            wait_rise = next_wait_rise
+            wait_fall = next_wait_fall
+
+    except Exception as exc:
+        with PRINT_LOCK:
+            stats["failed"] += 1
+        log(f"[扫描失败] {exchange} {symbol} {interval}: {type(exc).__name__}: {exc}")
+
+
+def run_one_round():
+    started = time.time()
+    try:
+        binance = get_binance_symbols()
+    except Exception as exc:
+        log("[Binance合约列表失败]", repr(exc)); binance = []
+    try:
+        bybit = get_bybit_symbols()
+    except Exception as exc:
+        log("[Bybit合约列表失败]", repr(exc)); bybit = []
+    server_times = {}
+    for ex in ("Binance", "Bybit"):
+        try:
+            server_times[ex] = fetch_server_time_ms(ex)
+            log(f"[{ex}] 交易所服务器时间：{datetime.fromtimestamp(server_times[ex]/1000, timezone.utc).isoformat()}")
+        except Exception as exc:
+            log(f"[{ex}] 服务器时间获取失败，本轮跳过该交易所：{exc}")
+    tasks = [(ex, sym, interval, server_times[ex]) for ex, symbols in (("Binance", binance), ("Bybit", bybit))
+             if ex in server_times for sym in symbols for interval in INTERVALS]
+    stats = {"success": 0, "failed": 0, "candidates": 0, "alerts": 0}
+    log(f"\n==== {VERSION} 扫描开始｜Binance={len(binance)} Bybit={len(bybit)} 任务={len(tasks)}｜UTC {datetime.now(timezone.utc).isoformat()} ====")
+    state = load_state()
+    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as pool:
+        futures = [pool.submit(process_one, ex, sym, interval, server_time_ms, state, stats)
+                   for ex, sym, interval, server_time_ms in tasks]
+        for f in as_completed(futures):
+            try: f.result()
+            except Exception as exc: log("[任务异常]", repr(exc))
+    log(f"==== 本轮结束｜成功={stats['success']} 失败={stats['failed']} 候选={stats['candidates']} 报警={stats['alerts']} 耗时={time.time()-started:.1f}秒 ====")
+
+
+if __name__ == "__main__":
+    log(f"启动 {VERSION}｜仅 Binance + Bybit USDT 加密货币永续｜紫/粉后续信号改为 RSI(6) 上穿/下穿 RSI(24)")
+    log("报警条件：最近已收盘K线为紫/粉后续箭头；前一根为青/黄加强箭头；再前一根为红/绿/青/黄任意箭头；每合约每小时最多报警一次；信号K线报价成交额 > 10000 USDT。")
+    log("去重规则：同一交易所/合约/1小时信号K线只报警一次，并按交易所/合约实施每小时一次限频；追踪状态持久化保存。")
+    log("仅发送紫色/粉色后续追踪信号；原有扫描、推送、成交额过滤、去重和循环框架保留。")
+    if len(NTFY_URLS) < 2:
+        log("[注意] 当前有效的 NTFY 推送地址数：", len(NTFY_URLS), "；请检查 NTFY_TOPIC 和 NTFY_SERVER_1 / NTFY_SERVER_2。")
+    else:
+        log(f"[NTFY] Topic={NTFY_TOPIC}｜已配置双推送：ntfy.sh + ntfy.envs.net")
+    while True:
+        try:
+            run_one_round()
+        except KeyboardInterrupt:
+            log("收到停止指令，退出。"); break
+        except Exception as exc:
+            log("[全局异常]", repr(exc))
+        time.sleep(SCAN_PAUSE_SECONDS)
